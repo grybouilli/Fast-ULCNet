@@ -1,6 +1,6 @@
 # Fast-ULCNet
 
-Official repository of **Fast-ULCNet**.
+Official repository of **Fast-ULCNet: A Fast and Ultra Low Complexity Network for Single-Channel Speech Enhancement**.
 
 The paper is available [here](https://arxiv.org/abs/2601.14925).
 
