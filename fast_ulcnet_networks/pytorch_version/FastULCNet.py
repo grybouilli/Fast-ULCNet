@@ -16,7 +16,7 @@ class STFTLayer(nn.Module):
         super().__init__()
         self.block_len = block_len
         self.block_shift = block_shift
-        self.window = window
+        self.register_buffer("window", window)
         
         print(type(self.window))
 
@@ -107,7 +107,7 @@ class ConvBlock(nn.Module):
         )
 
         self.pool = nn.MaxPool2d(kernel_size=(1, 2))
-        self.relu = nn.ReLU(inplace=True)
+        self.relu = nn.ReLU(inplace=False)
 
     def forward(self, x):
         x = self.relu(self.sepconv1(x))
@@ -126,7 +126,7 @@ class FastULCNet(nn.Module):
     """
     Fast-ULCNet network class.
     """
-    def __init__(self, config):
+    def __init__(self, config:dict):
         super().__init__()
         # data Params
         dp = config['data_parameters']
@@ -210,6 +210,7 @@ class FastULCNet(nn.Module):
         return torch.complex(dec_real, dec_imag)
 
     def forward(self, x):
+        input_length = x.shape[-1]
         # 1. STFT and Preprocessing
         stft_data = self.stft_layer(x)
         mag, phase, real, imag = self.feature_preprocessing(stft_data)
@@ -256,7 +257,22 @@ class FastULCNet(nn.Module):
         # Decompress
         estimated_speech = self.power_law_decompression(est_speech_comp)
         
-        return estimated_speech
+        # estimated_stft = torch.complex(
+        #     estimated_speech[..., 0],
+        #     estimated_speech[..., 1]
+        # )
+        estimated_speech = estimated_speech.permute(0, 2, 1)  # [B, F, T]
+
+        waveform = torch.istft(
+            estimated_speech,
+            n_fft=self.block_len,
+            hop_length=self.block_shift,
+            win_length=self.block_len,
+            window=self.stft_layer.window,
+            length=input_length,
+        )
+
+        return waveform
     
 if __name__ == '__main__':
     # Load config
