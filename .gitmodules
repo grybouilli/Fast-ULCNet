@@ -1,0 +1,4 @@
+[submodule "fast_ulcnet_networks/pytorch_version/torch_istft_onnx"]
+	path = fast_ulcnet_networks/pytorch_version/torch_istft_onnx
+	url = https://github.com/grybouilli/torch-istft-onnx.git
+	branch = feat/fix_slow_export

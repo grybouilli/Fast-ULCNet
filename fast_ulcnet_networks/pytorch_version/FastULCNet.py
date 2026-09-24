@@ -7,7 +7,7 @@ from comfi_fast_grnn_torch import ComfiFastGRNN
 from CRM_pytorch import ComplexRatioMask
 import yaml
 from torchinfo import summary
-
+from torch_istft_onnx.torch_istft_onnx.istft import ISTFT
 
 class STFTLayer(nn.Module):
     """
@@ -198,6 +198,10 @@ class FastULCNet(nn.Module):
         # Stage 1 Outputs
         self.fc1 = nn.Linear(2 * self.sub_band_rnn_units, freq_dim)
         self.fc2 = nn.Linear(freq_dim, freq_dim)
+        self.istft = ISTFT(n_fft=self.block_len,
+                    hop_length=self.block_shift,
+                    win_length=self.block_len,
+                    window=self.stft_layer.window)
 
         # Stage 2 CNN
         self.cnn_block = nn.Sequential(
@@ -232,7 +236,6 @@ class FastULCNet(nn.Module):
         return torch.complex(dec_real, dec_imag)
 
     def forward(self, x):
-        input_length = x.shape[-1]
         # 1. STFT and Preprocessing
         stft_data = self.stft_layer(x)
         mag, phase, real, imag = self.feature_preprocessing(stft_data)
@@ -278,22 +281,11 @@ class FastULCNet(nn.Module):
         est_speech_comp = self.crm_layer(real, imag, m_real, m_imag)
         # Decompress
         estimated_speech = self.power_law_decompression(est_speech_comp)
-
-        # estimated_stft = torch.complex(
-        #     estimated_speech[..., 0],
-        #     estimated_speech[..., 1]
-        # )
         estimated_speech = estimated_speech.permute(0, 2, 1)  # [B, F, T]
 
-        waveform = torch.istft(
-            estimated_speech,
-            n_fft=self.block_len,
-            hop_length=self.block_shift,
-            win_length=self.block_len,
-            window=self.stft_layer.window,
-            length=input_length,
-        )
-
+        # 10. Back to time-domain
+        spectro = torch.stack([estimated_speech.real, estimated_speech.imag], dim=-1)
+        waveform = self.istft(spectro)
         return waveform
 
 
