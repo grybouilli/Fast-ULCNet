@@ -55,6 +55,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import sys
+sys.path.insert(0, "./fast_ulcnet_networks/pytorch_version/")
 from fast_ulcnet_networks.pytorch_version.FastULCNet import FastULCNet
 from dataset.dns_dataset import DNSDataset
 from dataset.voicebankdemand_dataset import VoiceBankDemandDataset, make_loaders
@@ -153,23 +155,38 @@ class FastULCNetLoss(nn.Module):
 # ===========================================================================
 # Training & Validation loops
 # ===========================================================================
+def progress_bar(current: int, total: int, width=40):
+    percent = current / total
+    filled = int(width * percent)
+    bar = "█" * filled + "░" * (width - filled)
+    print(
+        f"\r[{bar}] {percent:.0%} ({current}/{total} Batch)",
+        end="",
+        flush=True,
+    )
 
+def train_one_batch(model, clean, noisy, criterion, optimizer, device, grad_clip: float = 3.0):
+    noisy = noisy.to(device)   # (B, T, F) complex
+    clean = clean.to(device)
+    optimizer.zero_grad()
+    pred = model(noisy)
+    loss = criterion(pred, clean)
+    loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    return loss
+    
 def train_one_epoch(model, loader, optimizer, criterion, device,
                     max_steps: int, grad_clip: float = 3.0):
     model.train()
     total_loss = 0.0
     steps = 0
-    for noisy, clean in loader:
+    batch_amount = len(loader)
+    for batch_idx, (noisy, clean) in enumerate(loader):
+        progress_bar(batch_idx + 1, batch_amount)
         if steps >= max_steps:
             break
-        noisy = noisy.to(device)   # (B, T, F) complex
-        clean = clean.to(device)
-        optimizer.zero_grad()
-        pred = model(noisy)
-        loss = criterion(pred, clean)
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        loss = train_one_batch(model, clean, noisy, criterion, optimizer, device, grad_clip)
         total_loss += loss.item()
         steps += 1
     return total_loss / max(steps, 1)
@@ -204,9 +221,15 @@ def main(args):
     # ------------------------------------------------------------------
     # Data
     # ------------------------------------------------------------------
+    import yaml
+    config = None
+    with open(args.config, 'r') as f:
+        config = yaml.load(f, Loader=yaml.SafeLoader)
+    model = FastULCNet(config).to(device)
     train_loader, val_loader = make_loaders( # Voice-Bank-DEMAND-16k dataset
         batch_size=args.batch_size,
         clip_len=args.clip_len,
+        window_len=config["data_parameters"]["block_len"],
         mode='crop',
         num_workers=args.num_workers
     )
@@ -224,13 +247,6 @@ def main(args):
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    import yaml
-    config = None
-    with open(args.config, 'r') as f:
-        config = yaml.load(f, Loader=yaml.SafeLoader)
-    model = FastULCNet(config
-    ).to(device)
-
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {n_params / 1e6:.3f} M")
 
@@ -298,6 +314,7 @@ def main(args):
             "optimizer"     : optimizer.state_dict(),
             "val_loss"      : val_loss,
             "best_val_loss" : best_val_loss,
+            "train_seq_len" : args.clip_len,
         }, ckpt_path)
 
         # Track best model
@@ -307,7 +324,7 @@ def main(args):
                                for k, v in model.state_dict().items()}
             no_improve_epochs = 0
             torch.save(best_state_dict,
-                       os.path.join(args.save_dir, "fast_ulcnet_best.pt"))
+                       os.path.join(args.save_dir, args.output_name))
             print(f"  ✓ New best model saved  (val_loss={best_val_loss:.5f})")
         else:
             no_improve_epochs += 1
@@ -357,6 +374,7 @@ def parse_args():
                         help="Epochs without val improvement before LR halving")
     parser.add_argument("--early_stop_patience", type=int, default=5,
                         help="Epochs without val improvement before early stop")
+    parser.add_argument("--output_name", type=str, default="fast_ulcnet_best.pt")
 
     # Misc
     parser.add_argument("--num_workers", type=int,   default=4)
