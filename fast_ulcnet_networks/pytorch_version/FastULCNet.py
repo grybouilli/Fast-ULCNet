@@ -50,29 +50,25 @@ class ChannelWiseFeatureReorientation(nn.Module):
         self.n_bands = math.ceil(
             ((self.input_freq_dim - self.window_size) / self.hop_size) + 1
         )
-
+    
     def forward(self, x):
         # x: [B, T, F]
         batch_size, time_dim, freq_dim = x.shape
-        subbands = []
-        for i in range(self.n_bands):
-            start = i * self.hop_size
-            end = start + self.window_size
-            if end > self.input_freq_dim:
-                # Padding logic
-                subband = x[:, :, start : self.input_freq_dim]
-                padding = torch.zeros(
-                    (batch_size, time_dim, end - self.input_freq_dim),
-                    device=x.device,
-                    dtype=x.dtype,
-                )
-                subband = torch.cat([subband, padding], dim=-1)
-            else:
-                subband = x[:, :, start:end]
-            subbands.append(subband)
 
-        # Stack into [B, T, n_bands, window_size]
-        return torch.stack(subbands, dim=2)
+        # Pad F dimension if needed so last band doesn't go out of bounds
+        pad_needed = (self.n_bands - 1) * self.hop_size + self.window_size - freq_dim
+        if pad_needed > 0:
+            x = F.pad(x, (0, pad_needed))  # pad last dim
+
+        # Use as_strided to extract all bands at once without a loop
+        # Target shape: [B, T, n_bands, window_size]
+        stride_b, stride_t, stride_f = x.stride()
+        x_strided = x.as_strided(
+            size=(batch_size, time_dim, self.n_bands, self.window_size),
+            stride=(stride_b, stride_t, stride_f * self.hop_size, stride_f),
+        )
+
+        return x_strided.contiguous()
 
 
 class SeparableConv2d(nn.Module):
@@ -167,7 +163,7 @@ class FastULCNet(nn.Module):
         self.crm_layer = ComplexRatioMask(masking_mode=mp["CRM_type"])
 
         # Conv Block
-        self.conv_block = ConvBlock(in_channels=8)
+        self.conv_block = ConvBlock(in_channels=self.reorientation.n_bands)
 
         # RNN units
         self.freq_rnn = ComfiFastGRNN(
