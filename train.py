@@ -59,7 +59,7 @@ import sys
 sys.path.insert(0, "./fast_ulcnet_networks/pytorch_version/")
 from fast_ulcnet_networks.pytorch_version.FastULCNet import FastULCNet
 from dataset.dns_dataset import DNSDataset
-from dataset.voicebankdemand_dataset import VoiceBankDemandDataset, make_loaders
+from dataset.voicebankdemand_dataset import make_vbd_loaders, make_loaders
 
 # ---------------------------------------------------------------------------
 # Reproducibility
@@ -226,23 +226,45 @@ def main(args):
     with open(args.config, 'r') as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
     model = FastULCNet(config).to(device)
-    train_loader, val_loader = make_loaders( # Voice-Bank-DEMAND-16k dataset
-        batch_size=args.batch_size,
-        clip_len=args.clip_len,
-        window_len=config["data_parameters"]["block_len"],
-        mode='crop',
-        num_workers=args.num_workers
-    )
-    # train_ds = DNSDataset(root=args.train_dir)
-    # val_ds   = DNSDataset(root=args.val_dir)
-    # train_loader = DataLoader(
-    #     train_ds, batch_size=args.batch_size,
-    #     shuffle=True,  num_workers=args.num_workers, pin_memory=True,
-    # )
-    # val_loader = DataLoader(
-    #     val_ds, batch_size=args.batch_size,
-    #     shuffle=False, num_workers=args.num_workers, pin_memory=True,
-    # )
+    
+    training_parameters = config["training_parameters"]
+    batch_size = training_parameters["batch_size"]
+    max_epochs = training_parameters["max_epochs"]
+    lr = training_parameters["adaptive_lr"]["lr"]
+    patience = training_parameters["adaptive_lr"]["patience"]
+    adaptive_lr_factor = training_parameters["adaptive_lr"]["factor"]
+    early_stop_patience = training_parameters["early_stopping"]["patience"]
+    
+    train_loader, val_loader = None, None
+    if args.train_dir == None or args.val_dir == None:
+        if args.vbd_ds == "Laroche":
+            print("Using Voice-Bank-DEMAND-16k dataset with Laroche's implementation")
+            train_loader, val_loader = make_vbd_loaders( # Voice-Bank-DEMAND-16k dataset
+                batch_size=batch_size,
+                clip_len=args.clip_len,
+                num_workers=args.num_workers
+            )
+        else:
+            print("Using Voice-Bank-DEMAND-16k dataset with custom implementation")
+            train_loader, val_loader = make_loaders( # Voice-Bank-DEMAND-16k dataset
+                batch_size=batch_size,
+                clip_len=args.clip_len,
+                window_len=config["data_parameters"]["block_len"],
+                mode="crop",
+                num_workers=args.num_workers
+            )
+    else:
+        print("Using DNS Challenge 2020 dataset")
+        train_ds = DNSDataset(root=args.train_dir)
+        val_ds   = DNSDataset(root=args.val_dir)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size,
+            shuffle=True,  num_workers=args.num_workers, pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size,
+            shuffle=False, num_workers=args.num_workers, pin_memory=True,
+        )
 
     # ------------------------------------------------------------------
     # Model
@@ -253,9 +275,9 @@ def main(args):
     # ------------------------------------------------------------------
     # Optimizer & scheduler
     # ------------------------------------------------------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=args.lr_patience,
+        optimizer, mode="min", factor=adaptive_lr_factor, patience=patience,
     )
     # criterion = FastULCNetLoss()
     criterion = FastULCNetLoss(
@@ -286,7 +308,7 @@ def main(args):
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, max_epochs):
         train_loss = train_one_epoch(
             model, train_loader, optimizer, criterion, device,
             max_steps = args.train_steps,
@@ -329,7 +351,7 @@ def main(args):
         else:
             no_improve_epochs += 1
             print(f"  No improvement for {no_improve_epochs} epoch(s).")
-            if no_improve_epochs >= args.early_stop_patience:
+            if no_improve_epochs >= early_stop_patience:
                 print(f"Early stopping after {epoch + 1} epochs.")
                 break
 
@@ -345,9 +367,9 @@ def parse_args():
         description="Train Fast-ULCNet (Arrieta Larraza & de Koeijer, ICASSP 2025)"
     )
     # Paths
-    parser.add_argument("--train_dir",  type=str, #required=True,
+    parser.add_argument("--train_dir",  type=str, default=None,
                         help="Directory with noisy/ and clean/ sub-folders (train)")
-    parser.add_argument("--val_dir",    type=str, #required=True,
+    parser.add_argument("--val_dir",    type=str, default=None,
                         help="Directory with noisy/ and clean/ sub-folders (val)")
     parser.add_argument("--save_dir",   type=str, default="checkpoints",
                         help="Where to save model checkpoints")
@@ -359,26 +381,19 @@ def parse_args():
                         help="Config file for model (.yaml)")
 
     # Training hyperparameters (paper §3.1.4)
-    parser.add_argument("--epochs",       type=int,   default=100)
-    parser.add_argument("--batch_size",   type=int,   default=32)
     parser.add_argument("--clip_len",   type=int,   default=32_000)
     parser.add_argument("--train_steps",  type=int,   default=4000,
                         help="Training steps per epoch (paper: 4000)")
     parser.add_argument("--val_steps",    type=int,   default=1000,
                         help="Validation steps per epoch (paper: 1000)")
-    parser.add_argument("--lr",           type=float, default=1e-3,
-                        help="Initial Adam learning rate (paper: 1e-3)")
     parser.add_argument("--grad_clip",    type=float, default=3.0,
                         help="Gradient clipping norm (paper: 3.0)")
-    parser.add_argument("--lr_patience",  type=int,   default=3,
-                        help="Epochs without val improvement before LR halving")
-    parser.add_argument("--early_stop_patience", type=int, default=5,
-                        help="Epochs without val improvement before early stop")
     parser.add_argument("--output_name", type=str, default="fast_ulcnet_best.pt")
 
     # Misc
     parser.add_argument("--num_workers", type=int,   default=4)
     parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--vbd_ds", type=str, default="custom")
     return parser.parse_args()
 
 

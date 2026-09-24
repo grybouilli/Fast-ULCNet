@@ -372,6 +372,13 @@ def load_voicebank_demand(cache_dir=None):
     from datasets import load_dataset
     return load_dataset("JacobLinCool/VoiceBank-DEMAND-16k", cache_dir=cache_dir)
 
+def collate_fn_pad(batch):
+    cleans, noisys = zip(*batch)
+    max_len = max(x.shape[-1] for x in cleans)
+    cleans = torch.stack([F.pad(x, (0, max_len - x.shape[-1])) for x in cleans])
+    noisys = torch.stack([F.pad(x, (0, max_len - x.shape[-1])) for x in noisys])
+    return cleans, noisys
+
 def make_vbd_loaders(
     batch_size:  int  = 16,
     clip_len:    int  = CLIP_LEN,
@@ -393,9 +400,10 @@ def make_vbd_loaders(
     print("Creating validation dataset ...")
     validset = VBDDataset(hf['test'], clip_len, split=False, shuffle=False)
     val_loader = DataLoader(validset, num_workers=1, shuffle=False,
-                                       batch_size=1,
+                                       batch_size=batch_size//2,
                                        pin_memory=True,
-                                       drop_last=True)
+                                       drop_last=True,
+                                       collate_fn=collate_fn_pad)
     return train_loader, val_loader
 
 # ---------------------------------------------------------------------------
