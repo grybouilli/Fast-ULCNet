@@ -244,6 +244,7 @@ class FastULCNet(nn.Module):
         return torch.complex(dec_real, dec_imag)
 
     def forward(self, x):
+        input_length = x.shape[-1]
         # 1. STFT and Preprocessing
         stft_data = x
         if self.has_temporal_input:
