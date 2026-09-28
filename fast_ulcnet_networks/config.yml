@@ -1,8 +1,9 @@
 # Data parameters
 data_parameters:
   fs: 16000
-  block_len: 512
-  block_shift: 128
+  n_fft: 512
+  hop_size: 256
+  win_size: 512
   hann_window: True
   compression_factor: 0.3
 
@@ -10,19 +11,26 @@ model_parameters:
   CRM_type: 'E' # Type of Complex-Ratio Mask ['R', 'C' or 'E']
   bidirectional_frnn_units: 64
   sub_band_rnn_units: 128
+  temporal_input: False
 
 # Training parameters
 training_parameters:
   batch_size: 32
   max_epochs: 300
   eps: 1.e-8
-
-  adaptive_lr:
-    lr: 1.e-3
+  loss: FastULCNet
+  clip_len: 32000
+  lr: 4.e-4
+  ReduceLROnPlateau:
     min_lr: 10.e-10
     factor: 0.5 
     patience: 3
     cooldown: 1
-
+  # Other possible scheduler:
+  # ExponentialLR:
+  #   gamma: 0.99 
+  # MultiplicativeLR:
+  #   factor: 0.1 
+  #   epoch_cycle: 3
   early_stopping:
     patience: 5
