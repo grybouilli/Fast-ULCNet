@@ -68,13 +68,13 @@ import random
 # STFT / audio constants  (must match the model's training setup)
 # ---------------------------------------------------------------------------
 SAMPLE_RATE = 16_000
-CLIP_LEN    = 32_000   # 2 s – a sensible default for VoiceBank-DEMAND;
-                        # change to 160_000 for 10 s clips like DNS2020.
-                        # Shorter clips → more variety per epoch, less
-                        # memory per batch.
-N_FFT       = 512
-HOP_LENGTH  = 256       # 16 ms  (paper: 16 ms hop)
-WIN_LENGTH  = 512       # 32 ms  (paper: 32 ms window)
+CLIP_LEN = 32_000  # 2 s – a sensible default for VoiceBank-DEMAND;
+# change to 160_000 for 10 s clips like DNS2020.
+# Shorter clips → more variety per epoch, less
+# memory per batch.
+N_FFT = 512
+HOP_LENGTH = 256  # 16 ms  (paper: 16 ms hop)
+WIN_LENGTH = 512  # 32 ms  (paper: 32 ms window)
 
 
 def _to_mono_tensor(audio_dict: dict) -> torch.Tensor:
@@ -84,18 +84,21 @@ def _to_mono_tensor(audio_dict: dict) -> torch.Tensor:
     """
     arr = audio_dict["array"]
     wav = torch.from_numpy(arr.astype(np.float32))
-    if wav.ndim == 2:               # (channels, samples)
+    if wav.ndim == 2:  # (channels, samples)
         wav = wav.mean(dim=0)
     elif wav.ndim > 2:
         raise ValueError(f"Unexpected audio shape: {wav.shape}")
-    return wav                      # (N,)
+    return wav  # (N,)
 
 
 # ---------------------------------------------------------------------------
 # Index builder helpers
 # ---------------------------------------------------------------------------
 
-def _build_chunk_index(hf_dataset, clip_len: int, pad_short: bool) -> list[tuple[int, int]]:
+
+def _build_chunk_index(
+    hf_dataset, clip_len: int, pad_short: bool
+) -> list[tuple[int, int]]:
     """
     Pre-scan every example and record (example_idx, start_sample) pairs so
     that __getitem__ can directly extract the right fixed-length slice.
@@ -112,13 +115,15 @@ def _build_chunk_index(hf_dataset, clip_len: int, pad_short: bool) -> list[tuple
             if pad_short:
                 index.append((i, 0))
         else:
-            n_chunks = n // clip_len          # integer divide → no remainder
+            n_chunks = n // clip_len  # integer divide → no remainder
             for c in range(n_chunks):
                 index.append((i, c * clip_len))
     return index
 
 
-def _build_crop_index(hf_dataset, clip_len: int, pad_short: bool) -> list[tuple[int, int]]:
+def _build_crop_index(
+    hf_dataset, clip_len: int, pad_short: bool
+) -> list[tuple[int, int]]:
     """
     Mode: crop – one entry per example, start=-1 means "crop randomly at runtime".
     Short clips get start=0 and will be padded.
@@ -128,15 +133,16 @@ def _build_crop_index(hf_dataset, clip_len: int, pad_short: bool) -> list[tuple[
         n = len(example["noisy"]["array"])
         if n < clip_len:
             if pad_short:
-                index.append((i, 0))          # 0 → will pad
+                index.append((i, 0))  # 0 → will pad
         else:
-            index.append((i, -1))             # -1 → random crop at __getitem__
+            index.append((i, -1))  # -1 → random crop at __getitem__
     return index
 
 
 # ---------------------------------------------------------------------------
 # Dataset class
 # ---------------------------------------------------------------------------
+
 
 class VoiceBankDemandDataset(Dataset):
     """
@@ -159,13 +165,18 @@ class VoiceBankDemandDataset(Dataset):
         False           – discard the clip entirely.
     """
 
-    def __init__(self, hf_dataset, clip_len=CLIP_LEN, window_len=WIN_LENGTH,
-                 mode="chunk", pad_short=True, index_cache_dir="./index_cache"):
-        self.ds        = hf_dataset
-        self.clip_len  = clip_len
-        self.mode      = mode
+    def __init__(
+        self,
+        hf_dataset,
+        clip_len=CLIP_LEN,
+        mode="chunk",
+        pad_short=True,
+        index_cache_dir="./index_cache",
+    ):
+        self.ds = hf_dataset
+        self.clip_len = clip_len
+        self.mode = mode
         self.pad_short = pad_short
-        self.window    = torch.hann_window(window_len)
 
         cache_path = self._cache_path(index_cache_dir)
 
@@ -173,8 +184,10 @@ class VoiceBankDemandDataset(Dataset):
             print(f"Loading cached index from {cache_path} ...")
             self._index = self._load_index(cache_path)
         else:
-            print(f"Building index (mode='{mode}', clip_len={clip_len}, "
-                  f"pad_short={pad_short}) over {len(hf_dataset)} examples ...")
+            print(
+                f"Building index (mode='{mode}', clip_len={clip_len}, "
+                f"pad_short={pad_short}) over {len(hf_dataset)} examples ..."
+            )
             if mode == "chunk":
                 self._index = _build_chunk_index(hf_dataset, clip_len, pad_short)
             elif mode == "crop":
@@ -185,9 +198,11 @@ class VoiceBankDemandDataset(Dataset):
             print(f"Index cached to {cache_path}")
 
         n_orig = len(hf_dataset)
-        n_idx  = len(self._index)
-        print(f"Index ready: {n_idx} samples from {n_orig} examples "
-              f"({n_idx / n_orig:.1f}× expansion).")
+        n_idx = len(self._index)
+        print(
+            f"Index ready: {n_idx} samples from {n_orig} examples "
+            f"({n_idx / n_orig:.1f}× expansion)."
+        )
 
     def _cache_path(self, cache_dir: str) -> Path:
         """Unique filename per (dataset size, mode, clip_len, pad_short)."""
@@ -244,12 +259,13 @@ class VoiceBankDemandDataset(Dataset):
             chunk = F.pad(chunk, (0, self.clip_len - chunk.shape[0]))
         return chunk
 
+
 class VBDDataset(torch.utils.data.Dataset):
     """
     Copyright (c) 2023 Yexin Lu (MP-SENet)
     Copyright (c) 2025-2026 Clément Laroche
     Dataset from : https://github.com/LarocheC/eco8-neaixt
-    
+
     Wraps a HuggingFace VoiceBank-DEMAND-16k split.
 
     Each row exposes paired ``clean`` and ``noisy`` audio decoded to numpy
@@ -258,8 +274,9 @@ class VBDDataset(torch.utils.data.Dataset):
     the full utterance during validation.
     """
 
-    def __init__(self, hf_split, segment_size : int, split=True,
-                 shuffle=True, seed=1234):
+    def __init__(
+        self, hf_split, segment_size: int, split=True, shuffle=True, seed=1234
+    ):
         self.hf_split = hf_split
         self.segment_size = segment_size
         self.split = split
@@ -284,7 +301,9 @@ class VBDDataset(torch.utils.data.Dataset):
         clean_audio = torch.from_numpy(clean_audio)
         noisy_audio = torch.from_numpy(noisy_audio)
 
-        norm_factor = torch.sqrt(len(noisy_audio) / (torch.sum(noisy_audio ** 2.0) + 1e-8))
+        norm_factor = torch.sqrt(
+            len(noisy_audio) / (torch.sum(noisy_audio**2.0) + 1e-8)
+        )
         clean_audio = (clean_audio * norm_factor).unsqueeze(0)
         noisy_audio = (noisy_audio * norm_factor).unsqueeze(0)
 
@@ -292,18 +311,24 @@ class VBDDataset(torch.utils.data.Dataset):
             if clean_audio.size(1) >= self.segment_size:
                 max_audio_start = clean_audio.size(1) - self.segment_size
                 audio_start = random.randint(0, max_audio_start)
-                clean_audio = clean_audio[:, audio_start: audio_start + self.segment_size]
-                noisy_audio = noisy_audio[:, audio_start: audio_start + self.segment_size]
+                clean_audio = clean_audio[
+                    :, audio_start : audio_start + self.segment_size
+                ]
+                noisy_audio = noisy_audio[
+                    :, audio_start : audio_start + self.segment_size
+                ]
             else:
                 pad = self.segment_size - clean_audio.size(1)
-                clean_audio = torch.nn.functional.pad(clean_audio, (0, pad), 'constant')
-                noisy_audio = torch.nn.functional.pad(noisy_audio, (0, pad), 'constant')
+                clean_audio = torch.nn.functional.pad(clean_audio, (0, pad), "constant")
+                noisy_audio = torch.nn.functional.pad(noisy_audio, (0, pad), "constant")
 
         return clean_audio.squeeze(0), noisy_audio.squeeze(0)
+
 
 # ---------------------------------------------------------------------------
 # collate_fn  – needed because complex tensors require explicit stacking
 # ---------------------------------------------------------------------------
+
 
 def collate_fn(batch: list[tuple[torch.Tensor, torch.Tensor]]):
     """
@@ -320,14 +345,14 @@ def collate_fn(batch: list[tuple[torch.Tensor, torch.Tensor]]):
 # Convenience factory
 # ---------------------------------------------------------------------------
 
+
 def make_loaders(
-    batch_size:  int  = 16,
-    clip_len:    int  = CLIP_LEN,
-    window_len:    int  = WIN_LENGTH,
-    mode:        Literal["chunk", "crop"] = "chunk",
-    pad_short:   bool = True,
-    num_workers: int  = 4,
-    pin_memory:  bool = True,
+    batch_size: int = 16,
+    clip_len: int = CLIP_LEN,
+    mode: Literal["chunk", "crop"] = "chunk",
+    pad_short: bool = True,
+    num_workers: int = 4,
+    pin_memory: bool = True,
 ):
     """
     Load the HuggingFace dataset and return (train_loader, val_loader).
@@ -345,32 +370,49 @@ def make_loaders(
     print("Downloading / loading JacobLinCool/VoiceBank-DEMAND-16k ...")
     hf = load_dataset("JacobLinCool/VoiceBank-DEMAND-16k")
 
-    train_ds = VoiceBankDemandDataset(hf["train"], clip_len=clip_len, window_len=window_len,
-                                      mode=mode, pad_short=pad_short)
-    val_ds   = VoiceBankDemandDataset(hf["test"],  clip_len=clip_len, window_len=window_len,
-                                      mode=mode, pad_short=pad_short)
+    train_ds = VoiceBankDemandDataset(
+        hf["train"],
+        clip_len=clip_len,
+        mode=mode,
+        pad_short=pad_short,
+    )
+    val_ds = VoiceBankDemandDataset(
+        hf["test"],
+        clip_len=clip_len,
+        mode=mode,
+        pad_short=pad_short,
+    )
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=pin_memory,
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=pin_memory,
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         collate_fn=collate_fn,
     )
     return train_loader, val_loader
 
+
 def load_voicebank_demand(cache_dir=None):
     """
-        Copyright (c) 2023 Yexin Lu (MP-SENet)
-        Copyright (c) 2025-2026 Clément Laroche
-        function from : https://github.com/LarocheC/eco8-neaixt
-        Load JacobLinCool/VoiceBank-DEMAND-16k (train + test splits).
+    Copyright (c) 2023 Yexin Lu (MP-SENet)
+    Copyright (c) 2025-2026 Clément Laroche
+    function from : https://github.com/LarocheC/eco8-neaixt
+    Load JacobLinCool/VoiceBank-DEMAND-16k (train + test splits).
     """
     from datasets import load_dataset
+
     return load_dataset("JacobLinCool/VoiceBank-DEMAND-16k", cache_dir=cache_dir)
+
 
 def collate_fn_pad(batch):
     cleans, noisys = zip(*batch)
@@ -379,32 +421,41 @@ def collate_fn_pad(batch):
     noisys = torch.stack([F.pad(x, (0, max_len - x.shape[-1])) for x in noisys])
     return cleans, noisys
 
+
 def make_vbd_loaders(
-    batch_size:  int  = 16,
-    clip_len:    int  = CLIP_LEN,
-    num_workers: int  = 4,
-    pin_memory:  bool = True,
+    batch_size: int = 16,
+    clip_len: int = CLIP_LEN,
+    num_workers: int = 4,
+    pin_memory: bool = True,
 ):
     from torch.utils.data import DataLoader
+
     print("Downloading / loading JacobLinCool/VoiceBank-DEMAND-16k ...")
     hf = load_voicebank_demand()
     print("Creating training dataset ...")
-    trainset = VBDDataset(hf['train'], clip_len,
-                       split=True, shuffle=True)
-    train_loader = DataLoader(trainset, shuffle=False,
-                              num_workers=num_workers,
-                              batch_size=batch_size,
-                              pin_memory=pin_memory,
-                              drop_last=True)
-    
+    trainset = VBDDataset(hf["train"], clip_len, split=True, shuffle=True)
+    train_loader = DataLoader(
+        trainset,
+        shuffle=False,
+        num_workers=num_workers,
+        batch_size=batch_size,
+        pin_memory=pin_memory,
+        drop_last=True,
+    )
+
     print("Creating validation dataset ...")
-    validset = VBDDataset(hf['test'], clip_len, split=False, shuffle=False)
-    val_loader = DataLoader(validset, num_workers=1, shuffle=False,
-                                       batch_size=batch_size//2,
-                                       pin_memory=True,
-                                       drop_last=True,
-                                       collate_fn=collate_fn_pad)
+    validset = VBDDataset(hf["test"], clip_len, split=False, shuffle=False)
+    val_loader = DataLoader(
+        validset,
+        num_workers=1,
+        shuffle=False,
+        batch_size=batch_size // 2,
+        pin_memory=True,
+        drop_last=True,
+        collate_fn=collate_fn_pad,
+    )
     return train_loader, val_loader
+
 
 # ---------------------------------------------------------------------------
 # Quick smoke-test  (run: python voicebank_dataset.py)
@@ -420,8 +471,10 @@ if __name__ == "__main__":
     for mode in ("chunk", "crop"):
         for pad_short in (True, False):
             ds = VoiceBankDemandDataset(
-                hf["train"], clip_len=32_000,
-                mode=mode, pad_short=pad_short,
+                hf["train"],
+                clip_len=32_000,
+                mode=mode,
+                pad_short=pad_short,
             )
             loader = DataLoader(ds, batch_size=4, collate_fn=collate_fn)
             noisy, clean = next(iter(loader))

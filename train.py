@@ -58,10 +58,11 @@ from torch.utils.data import DataLoader
 import sys
 
 sys.path.insert(0, "./fast_ulcnet_networks/pytorch_version/")
-from fast_ulcnet_networks.pytorch_version.FastULCNet import FastULCNet, STFTLayer
+from fast_ulcnet_networks.pytorch_version.FastULCNet import FastULCNet, STFTLayer, ISTFT
 from dataset.dns_dataset import make_dns_loaders
 from dataset.voicebankdemand_dataset import make_vbd_loaders, make_loaders
-from losses import FastULCNetLoss, MSELoss
+from losses import FastULCNetLoss, MSELoss, LossConfig
+from optimizer_scheduler_inst import OptimizerSchedulerInst
 import libsegmenter
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,7 @@ def infer_one(
     clean,
     noisy,
     device,
+    criterion,
     optimizer=None,
     is_input_temporal: bool = True,
     stft=None,
@@ -107,7 +109,8 @@ def infer_one(
     if optimizer != None:
         optimizer.zero_grad()
     pred = model(noisy)
-    return pred
+    loss = criterion(pred, clean)
+    return loss
 
 
 def train_one_batch(
@@ -121,16 +124,16 @@ def train_one_batch(
     is_input_temporal=True,
     stft=None,
 ):
-    pred = infer_one(
+    loss = infer_one(
         model,
         clean,
         noisy,
         device=device,
+        criterion=criterion,
         optimizer=optimizer,
         is_input_temporal=is_input_temporal,
         stft=stft,
     )
-    loss = criterion(pred, clean)
     loss.backward()
     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
@@ -179,13 +182,20 @@ def validate(
     model.eval()
     total_loss = 0.0
     steps = 0
-    for noisy, clean in loader:
+    batch_amount = len(loader)
+    for batch_idx, (noisy, clean) in enumerate(loader):
+        progress_bar(batch_idx + 1, batch_amount)
         if steps >= max_steps:
             break
-        pred = infer_one(
-            model, clean, noisy, device, is_input_temporal=is_input_temporal, stft=stft
+        loss = infer_one(
+            model,
+            clean,
+            noisy,
+            device,
+            criterion=criterion,
+            is_input_temporal=is_input_temporal,
+            stft=stft,
         )
-        loss = criterion(pred, clean)
         total_loss += loss.item()
         steps += 1
     return total_loss / max(steps, 1)
@@ -214,9 +224,7 @@ def main(args):
     training_parameters = config["training_parameters"]
     batch_size = training_parameters["batch_size"]
     max_epochs = training_parameters["max_epochs"]
-    lr = training_parameters["adaptive_lr"]["lr"]
-    patience = training_parameters["adaptive_lr"]["patience"]
-    adaptive_lr_factor = training_parameters["adaptive_lr"]["factor"]
+    clip_len = training_parameters["clip_len"]
     early_stop_patience = training_parameters["early_stopping"]["patience"]
     is_input_temporal = config["model_parameters"]["temporal_input"]
     stft = None
@@ -233,7 +241,7 @@ def main(args):
             train_loader, val_loader = (
                 make_vbd_loaders(  # Voice-Bank-DEMAND-16k dataset
                     batch_size=batch_size,
-                    clip_len=args.clip_len,
+                    clip_len=clip_len,
                     num_workers=args.num_workers,
                 )
             )
@@ -241,14 +249,14 @@ def main(args):
             print("Using Voice-Bank-DEMAND-16k dataset with custom implementation")
             train_loader, val_loader = make_loaders(  # Voice-Bank-DEMAND-16k dataset
                 batch_size=batch_size,
-                clip_len=args.clip_len,
+                clip_len=clip_len,
                 mode="crop",
                 num_workers=args.num_workers,
             )
     else:
         print(f"Using DNS Challenge 2020 dataset: {args.dataset_dir}")
         train_loader, val_loader = make_dns_loaders(
-            args.dataset_dir, batch_size=batch_size, clip_len=args.clip_len
+            args.dataset_dir, batch_size=batch_size, clip_len=clip_len
         )
 
     # ------------------------------------------------------------------
@@ -258,31 +266,17 @@ def main(args):
     print(f"Model parameters: {n_params / 1e6:.3f} M")
 
     # ------------------------------------------------------------------
-    # Optimizer & scheduler
+    # Optimizer, scheduler & loss
     # ------------------------------------------------------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=adaptive_lr_factor,
-        patience=patience,
+    osi = OptimizerSchedulerInst(config, model)
+    optimizer = osi.optimizer
+
+    loss_config = LossConfig(
+        config,
+        window,
+        device,
     )
-    criterion = None
-    if "loss" not in training_parameters or training_parameters["loss"] == "FastULCNet":
-        criterion = FastULCNetLoss(
-            n_fft=config["data_parameters"]["n_fft"],
-            hop_length=config["data_parameters"]["hop_size"],
-            win_length=config["data_parameters"]["win_size"],
-            window=window,
-            is_input_temporal=is_input_temporal,
-        ).to(device)
-    elif training_parameters["loss"] == "MSE":
-        criterion = MSELoss(
-            n_fft=config["data_parameters"]["n_fft"],
-            hop_length=config["data_parameters"]["hop_size"],
-            alpha=0.3,
-            is_input_temporal=is_input_temporal,
-        ).to(device)
+    criterion = loss_config.criterion
 
     # ------------------------------------------------------------------
     # (Optional) Resume from checkpoint
@@ -317,6 +311,7 @@ def main(args):
             is_input_temporal=is_input_temporal,
             stft=stft,
         )
+        print()
         val_loss = validate(
             model,
             val_loader,
@@ -326,11 +321,11 @@ def main(args):
             is_input_temporal=is_input_temporal,
             stft=stft,
         )
-        scheduler.step(val_loss)
+        osi.step(metric=val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
         print(
-            f"Epoch {epoch:03d} | "
+            f"  Epoch {epoch:03d} | "
             f"train_loss={train_loss:.5f} | "
             f"val_loss={val_loss:.5f} | "
             f"lr={current_lr:.2e}"
@@ -345,7 +340,7 @@ def main(args):
                 "optimizer": optimizer.state_dict(),
                 "val_loss": val_loss,
                 "best_val_loss": best_val_loss,
-                "train_seq_len": args.clip_len,
+                "train_seq_len": clip_len,
             },
             ckpt_path,
         )
@@ -401,7 +396,6 @@ def parse_args():
     )
 
     # Training hyperparameters (paper §3.1.4)
-    parser.add_argument("--clip_len", type=int, default=32_000)
     parser.add_argument(
         "--train_steps",
         type=int,

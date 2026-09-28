@@ -19,12 +19,18 @@ training_parameters:
   max_epochs: 300
   eps: 1.e-8
   loss: FastULCNet
-  adaptive_lr:
-    lr: 1.e-3
+  clip_len: 32000
+  lr: 4.e-4
+  ReduceLROnPlateau:
     min_lr: 10.e-10
     factor: 0.5 
     patience: 3
     cooldown: 1
-
+  # Other possible scheduler:
+  # ExponentialLR:
+  #   gamma: 0.99 
+  # MultiplicativeLR:
+  #   factor: 0.1 
+  #   epoch_cycle: 3
   early_stopping:
     patience: 5

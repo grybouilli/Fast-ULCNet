@@ -89,12 +89,6 @@ import torch.nn.functional as F
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def cosine_similarity_loss(s: torch.Tensor, s_hat: torch.Tensor) -> torch.Tensor:
-    """Time-domain cosine-similarity loss: 1 - cos(s, s_hat)."""
-    # s, s_hat: (batch, time)
-    return 1.0 - F.cosine_similarity(s, s_hat, dim=-1).mean()
-
-
 def stft(
     signal: torch.Tensor,
     n_fft: int,
@@ -116,8 +110,6 @@ def stft(
 
 
 # ── Loss 1: MSE in the compressed frequency domain ───────────────────────────
-
-
 class MSELoss(nn.Module):
     """
     L_MSE  –  Mean Squared Error in the compressed frequency domain.
@@ -155,137 +147,86 @@ class MSELoss(nn.Module):
         return F.mse_loss(mag, mag_hat)
 
 
-# ── Loss 2: Multi-Scale loss  (L_MS) ─────────────────────────────────────────
-
-
-class MultiScaleLoss(nn.Module):
+# Loss instanciater
+class LossConfig:
     """
-    L_MS  =  Σ_j (1/K) Σ_{k=1}^{K} CS(s_{jk}, ŝ_{jk})
-           + Σ_i || |S_i|^α  -  |Ŝ_i|^α ||²_F
+    Instantiates a loss function from a parsed YAML config dict.
 
-    where
-      • j ∈ L = {16, …, 128} ms indexes segment lengths used for
-        the time-domain cosine-similarity (CS) term,
-      • i ∈ {1, …, I} indexes STFT window sizes W = {16, …, 64} ms,
-      • α controls magnitude compression (default 0.3).
-
-    The spectral term is called L_spec in the paper.
-    """
-
-    def __init__(
-        self,
-        sample_rate: int = 16_000,
-        segment_lengths_ms: list[int] | None = None,  # j
-        stft_window_sizes_ms: list[int] | None = None,  # i
-        alpha: float = 0.3,
-    ):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.alpha = alpha
-
-        # segment lengths L for the CS term
-        seg_ms = segment_lengths_ms or list(range(16, 129, 16))  # 16…128 ms
-        self.segment_lengths = [int(ms * sample_rate / 1000) for ms in seg_ms]
-
-        # STFT window sizes W for the spectral term
-        win_ms = stft_window_sizes_ms or list(range(16, 65, 16))  # 16…64 ms
-        self.stft_windows = [int(ms * sample_rate / 1000) for ms in win_ms]
-
-    # ---- spectral term L_spec -----------------------------------------------
-    def _l_spec(self, s: torch.Tensor, s_hat: torch.Tensor) -> torch.Tensor:
-        loss = torch.tensor(0.0, device=s.device)
-        for win in self.stft_windows:
-            S = stft(s, n_fft=win)
-            S_hat = stft(s_hat, n_fft=win)
-            mag = S.abs().pow(self.alpha)
-            mag_hat = S_hat.abs().pow(self.alpha)
-            # Frobenius norm squared, averaged over batch
-            diff = mag - mag_hat
-            loss = loss + (diff * diff).sum(dim=(-2, -1)).mean()
-        return loss
-
-    # ---- time-domain CS term ------------------------------------------------
-    def _l_cs(self, s: torch.Tensor, s_hat: torch.Tensor) -> torch.Tensor:
-        """
-        For every segment length j, chop the signal into K non-overlapping
-        frames and average the cosine-similarity losses.
-        """
-        loss = torch.tensor(0.0, device=s.device)
-        T = s.shape[-1]
-        for seg_len in self.segment_lengths:
-            K = T // seg_len
-            if K == 0:
-                continue
-            # (batch, K, seg_len)
-            s_segs = s[..., : K * seg_len].reshape(s.shape[0], K, seg_len)
-            s_hat_segs = s_hat[..., : K * seg_len].reshape(s_hat.shape[0], K, seg_len)
-            # flatten batch & K for cosine_similarity
-            s_flat = s_segs.reshape(-1, seg_len)
-            s_hat_flat = s_hat_segs.reshape(-1, seg_len)
-            cs = 1.0 - F.cosine_similarity(s_flat, s_hat_flat, dim=-1)
-            loss = loss + cs.mean()
-        return loss / max(len(self.segment_lengths), 1)
-
-    def forward(self, s: torch.Tensor, s_hat: torch.Tensor):
-        l_cs = self._l_cs(s, s_hat)
-        l_spec = self._l_spec(s, s_hat)
-        return l_cs + l_spec, l_cs, l_spec  # return components for logging
-
-
-# ── Loss 3: Multi-Target loss  (L_MT) ────────────────────────────────────────
-
-
-class MultiTargetLoss(nn.Module):
-    """
-    L_MT  =  L_spec  +  Σ_i || |S_i|^α ⊙ e^{jφ_s}  -  |Ŝ_i|^α ⊙ e^{jφ_ŝ} ||²_F
-
-    Adds a phase-aware term on top of L_spec.  The Hadamard product ⊙ with
-    e^{jφ} reconstructs a 'phase-aware compressed spectrogram', allowing the
-    loss to penalise phase errors in addition to magnitude errors.
+    Expected config structure:
+        data_parameters:
+          n_fft: 512
+          hop_size: 256
+          win_size: 512
+          ...
+        model_parameters:
+          temporal_input: False
+        training_parameters:
+          loss: MSE
+          MSE:                  # optional block to override defaults
+            alpha: 0.5
     """
 
-    def __init__(
-        self,
-        sample_rate: int = 16_000,
-        stft_window_sizes_ms: list[int] | None = None,
-        alpha: float = 0.3,
-    ):
-        super().__init__()
-        self.alpha = alpha
-        win_ms = stft_window_sizes_ms or list(range(16, 65, 16))
-        self.stft_windows = [int(ms * sample_rate / 1000) for ms in win_ms]
+    SUPPORTED_LOSSES = {"MSE", "FastULCNet"}
 
-    def forward(self, s: torch.Tensor, s_hat: torch.Tensor):
-        l_spec = torch.tensor(0.0, device=s.device)
-        l_phase = torch.tensor(0.0, device=s.device)
+    def __init__(self, config: dict, window: torch.Tensor, device: torch.device):
+        data_p = config.get("data_parameters", {})
+        model_p = config.get("model_parameters", {})
+        train_p = config.get("training_parameters", {})
 
-        for win in self.stft_windows:
-            S = stft(s, n_fft=win)  # complex (B, F, T)
-            S_hat = stft(s_hat, n_fft=win)
+        self.loss_name = train_p.get("loss")
+        self.loss_overrides = train_p.get(self.loss_name, {})  # optional per-loss block
+        self.is_temporal = model_p.get("temporal_input", False)
+        self.n_fft = data_p.get("n_fft", 512)
+        self.hop_length = data_p.get("hop_size", 256)
+        self.win_length = data_p.get("win_size", 512)
+        self.window = window
+        self.device = device
 
-            mag = S.abs()
-            mag_hat = S_hat.abs()
+        if self.loss_name not in self.SUPPORTED_LOSSES:
+            raise ValueError(
+                f"Unsupported loss '{self.loss_name}'. "
+                f"Choose from: {self.SUPPORTED_LOSSES}"
+            )
 
-            # ---- L_spec term ------------------------------------------------
-            diff_mag = mag.pow(self.alpha) - mag_hat.pow(self.alpha)
-            l_spec = l_spec + (diff_mag * diff_mag).sum(dim=(-2, -1)).mean()
+        self.criterion = self._build_loss()
 
-            # ---- Phase term -------------------------------------------------
-            # e^{jφ} = S / |S|  (unit-magnitude phasor)
-            eps = 1e-8
-            phase_s = S / (mag + eps)  # complex, |·| = 1
-            phase_s_hat = S_hat / (mag_hat + eps)
+    def _get(self, key, default):
+        """Resolve a param: per-loss override block takes priority over the default."""
+        return self.loss_overrides.get(key, default)
 
-            # |S|^α ⊙ e^{jφ_s}  — compressed magnitude × phase phasor
-            target = mag.pow(self.alpha) * phase_s  # complex product
-            pred = mag_hat.pow(self.alpha) * phase_s_hat
+    def _build_loss(self) -> nn.Module:
+        match self.loss_name:
+            case "MSE":
+                criterion = MSELoss(
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    alpha=self._get("alpha", 0.3),
+                    is_input_temporal=self.is_temporal,
+                )
 
-            diff = target - pred
-            # ||·||²_F  over (freq, time), averaged over batch
-            l_phase = l_phase + (diff.abs() ** 2).sum(dim=(-2, -1)).mean()
+            case "FastULCNet":
+                criterion = FastULCNetLoss(
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
+                    win_length=self.win_length,
+                    window=self.window,
+                    is_input_temporal=self.is_temporal,
+                )
 
-        l_mt = l_spec + l_phase
-        return l_mt, l_spec, l_phase  # return components for logging
+        return criterion.to(self.device)
+
+    def __call__(self, *args, **kwargs):
+        """Delegate directly so LossConfig can be used in place of the criterion."""
+        return self.criterion(*args, **kwargs)
+
+    def __repr__(self):
+        return (
+            f"LossConfig(\n"
+            f"  loss={self.loss_name},\n"
+            f"  is_temporal={self.is_temporal},\n"
+            f"  overrides={self.loss_overrides}\n"
+            f")"
+        )
 
 
 # ── quick sanity-check ────────────────────────────────────────────────────────
