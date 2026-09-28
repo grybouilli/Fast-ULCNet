@@ -9,24 +9,26 @@ import yaml
 from torchinfo import summary
 from torch_istft_onnx.torch_istft_onnx.istft import ISTFT
 
+
 class STFTLayer(nn.Module):
     """
     Custom Pytorch Layer for computing STFT.
     """
 
-    def __init__(self, block_len, block_shift, window=None):
+    def __init__(self, n_fft, hop_size, win_length, window=None):
         super().__init__()
-        self.block_len = block_len
-        self.block_shift = block_shift
+        self.n_fft = n_fft
+        self.hop_size = hop_size
+        self.win_length = win_length
         self.register_buffer("window", window)
 
     def forward(self, x):
         # x: [Batch, Samples]
         stft = torch.stft(
             x,
-            n_fft=self.block_len,
-            hop_length=self.block_shift,
-            win_length=self.block_len,
+            n_fft=self.n_fft,
+            hop_length=self.hop_size,
+            win_length=self.win_length,
             window=self.window,
             center=True,
             return_complex=True,
@@ -50,7 +52,7 @@ class ChannelWiseFeatureReorientation(nn.Module):
         self.n_bands = math.ceil(
             ((self.input_freq_dim - self.window_size) / self.hop_size) + 1
         )
-    
+
     def forward(self, x):
         # x: [B, T, F]
         batch_size, time_dim, freq_dim = x.shape
@@ -138,27 +140,33 @@ class FastULCNet(nn.Module):
         super().__init__()
         # data Params
         dp = config["data_parameters"]
-        self.block_len = dp["block_len"]
-        self.block_shift = dp["block_shift"]
+        self.n_fft = dp["n_fft"]
+        self.hop_size = dp["hop_size"]
+        self.win_size = dp["win_size"]
         self.compression_factor = dp["compression_factor"]
-        freq_dim = int(self.block_len // 2 + 1)
+        freq_dim = int(self.n_fft // 2 + 1)
 
         # model params
         mp = config["model_parameters"]
         self.bidirectional_frnn_units = mp["bidirectional_frnn_units"]
         self.sub_band_rnn_units = mp["sub_band_rnn_units"]
+        self.has_temporal_input = mp["temporal_input"]
 
         # Layers
-        window = (
-            torch.from_numpy(
-                libsegmenter.WindowSelector(
-                    "hann75", "wola", self.block_len
-                ).analysis_window,
-            ).float()
-            if dp["hann_window"]
-            else None
-        )
-        self.stft_layer = STFTLayer(self.block_len, self.block_shift, window)
+        self.stft_layer = None
+        if self.has_temporal_input:
+            window = (
+                torch.from_numpy(
+                    libsegmenter.WindowSelector(
+                        "hann75", "wola", self.win_size
+                    ).analysis_window,
+                ).float()
+                if dp["hann_window"]
+                else None
+            )
+            self.stft_layer = STFTLayer(
+                self.n_fft, self.hop_size, self.win_size, window
+            )
         self.reorientation = ChannelWiseFeatureReorientation(input_freq_dim=freq_dim)
         self.crm_layer = ComplexRatioMask(masking_mode=mp["CRM_type"])
 
@@ -194,10 +202,14 @@ class FastULCNet(nn.Module):
         # Stage 1 Outputs
         self.fc1 = nn.Linear(2 * self.sub_band_rnn_units, freq_dim)
         self.fc2 = nn.Linear(freq_dim, freq_dim)
-        self.istft = ISTFT(n_fft=self.block_len,
-                    hop_length=self.block_shift,
-                    win_length=self.block_len,
-                    window=self.stft_layer.window)
+        self.istft = None
+        if self.has_temporal_input:
+            self.istft = ISTFT(
+                n_fft=self.block_len,
+                hop_length=self.block_shift,
+                win_length=self.win_size,
+                window=self.stft_layer.window,
+            )
 
         # Stage 2 CNN
         self.cnn_block = nn.Sequential(
@@ -233,7 +245,9 @@ class FastULCNet(nn.Module):
 
     def forward(self, x):
         # 1. STFT and Preprocessing
-        stft_data = self.stft_layer(x)
+        stft_data = x
+        if self.has_temporal_input:
+            stft_data = self.stft_layer(x)
         mag, phase, real, imag = self.feature_preprocessing(stft_data)
 
         # 2. Reorientation: [B, T, F] -> [B, T, n_bands, window_size]
@@ -277,12 +291,15 @@ class FastULCNet(nn.Module):
         est_speech_comp = self.crm_layer(real, imag, m_real, m_imag)
         # Decompress
         estimated_speech = self.power_law_decompression(est_speech_comp)
-        estimated_speech = estimated_speech.permute(0, 2, 1)  # [B, F, T]
-
-        # 10. Back to time-domain
-        spectro = torch.stack([estimated_speech.real, estimated_speech.imag], dim=-1)
-        waveform = self.istft(spectro)
-        return waveform
+        if self.has_temporal_input:
+            # 10. Back to time-domain
+            estimated_speech = estimated_speech.permute(0, 2, 1)  # [B, F, T]
+            spectro = torch.stack(
+                [estimated_speech.real, estimated_speech.imag], dim=-1
+            )
+            waveform = self.istft(spectro)
+            return waveform
+        return estimated_speech
 
 
 if __name__ == "__main__":

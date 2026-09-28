@@ -56,100 +56,24 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import sys
+
 sys.path.insert(0, "./fast_ulcnet_networks/pytorch_version/")
-from fast_ulcnet_networks.pytorch_version.FastULCNet import FastULCNet
-from dataset.dns_dataset import DNSDataset
+from fast_ulcnet_networks.pytorch_version.FastULCNet import FastULCNet, STFTLayer
+from dataset.dns_dataset import make_dns_loaders
 from dataset.voicebankdemand_dataset import make_vbd_loaders, make_loaders
+from losses import FastULCNetLoss, MSELoss
+import libsegmenter
 
 # ---------------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------------
+
 
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-# ===========================================================================
-# Loss Function (eq. 5)
-# ===========================================================================
-
-class FastULCNetLoss(nn.Module):
-    """
-    Spectrogram-domain loss for waveform-to-waveform enhancement.
-
-    The model operates on raw waveforms:
-
-        pred   : (B, samples)
-        target : (B, samples)
-
-    Both are converted to complex STFTs before computing:
-
-        L = L_mag + L_complex
-
-    where
-
-        L_mag     = mean(||S_pred| - |S_target||)
-        L_complex = mean(|S_pred - S_target|)
-    """
-
-    def __init__(
-        self,
-        n_fft: int,
-        hop_length: int,
-        win_length: int,
-        window: torch.Tensor,
-    ):
-        super().__init__()
-
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.win_length = win_length
-
-        # Important: move this with the loss when calling loss.to(device)
-        self.register_buffer("window", window)
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            pred   : (B, samples) predicted waveform
-            target : (B, samples) clean waveform
-
-        Returns:
-            Scalar spectrogram-domain loss.
-        """
-
-        pred_stft = torch.stft(
-            pred,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            return_complex=True,
-        )
-
-        target_stft = torch.stft(
-            target,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length,
-            win_length=self.win_length,
-            window=self.window,
-            return_complex=True,
-        )
-
-        pred_mag = pred_stft.abs()
-        target_mag = target_stft.abs()
-
-        mag_loss = (pred_mag - target_mag).abs().mean()
-        cplx_loss = (pred_stft - target_stft).abs().mean()
-
-        return mag_loss + cplx_loss
 
 
 # ===========================================================================
@@ -165,19 +89,65 @@ def progress_bar(current: int, total: int, width=40):
         flush=True,
     )
 
-def train_one_batch(model, clean, noisy, criterion, optimizer, device, grad_clip: float = 3.0):
-    noisy = noisy.to(device)   # (B, T, F) complex
+
+def infer_one(
+    model,
+    clean,
+    noisy,
+    device,
+    optimizer=None,
+    is_input_temporal: bool = True,
+    stft=None,
+):
+    if not is_input_temporal:
+        noisy = stft(noisy)  # (B, T, F) complex
+        clean = stft(clean)
+    noisy = noisy.to(device)
     clean = clean.to(device)
-    optimizer.zero_grad()
+    if optimizer != None:
+        optimizer.zero_grad()
     pred = model(noisy)
+    return pred
+
+
+def train_one_batch(
+    model,
+    clean,
+    noisy,
+    criterion,
+    optimizer,
+    device,
+    grad_clip: float = 3.0,
+    is_input_temporal=True,
+    stft=None,
+):
+    pred = infer_one(
+        model,
+        clean,
+        noisy,
+        device=device,
+        optimizer=optimizer,
+        is_input_temporal=is_input_temporal,
+        stft=stft,
+    )
     loss = criterion(pred, clean)
     loss.backward()
     nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
     return loss
-    
-def train_one_epoch(model, loader, optimizer, criterion, device,
-                    max_steps: int, grad_clip: float = 3.0):
+
+
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device,
+    max_steps: int,
+    grad_clip: float = 3.0,
+    is_input_temporal=True,
+    stft=None,
+):
     model.train()
     total_loss = 0.0
     steps = 0
@@ -186,23 +156,35 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
         progress_bar(batch_idx + 1, batch_amount)
         if steps >= max_steps:
             break
-        loss = train_one_batch(model, clean, noisy, criterion, optimizer, device, grad_clip)
+        loss = train_one_batch(
+            model,
+            clean,
+            noisy,
+            criterion,
+            optimizer,
+            device,
+            grad_clip,
+            is_input_temporal,
+            stft,
+        )
         total_loss += loss.item()
         steps += 1
     return total_loss / max(steps, 1)
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, max_steps: int):
+def validate(
+    model, loader, criterion, device, max_steps: int, is_input_temporal=True, stft=None
+):
     model.eval()
     total_loss = 0.0
     steps = 0
     for noisy, clean in loader:
         if steps >= max_steps:
             break
-        noisy = noisy.to(device)
-        clean = clean.to(device)
-        pred = model(noisy)
+        pred = infer_one(
+            model, clean, noisy, device, is_input_temporal=is_input_temporal, stft=stft
+        )
         loss = criterion(pred, clean)
         total_loss += loss.item()
         steps += 1
@@ -213,6 +195,7 @@ def validate(model, loader, criterion, device, max_steps: int):
 # Main training entry-point
 # ===========================================================================
 
+
 def main(args):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -222,11 +205,12 @@ def main(args):
     # Data
     # ------------------------------------------------------------------
     import yaml
+
     config = None
-    with open(args.config, 'r') as f:
+    with open(args.config, "r") as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
     model = FastULCNet(config).to(device)
-    
+
     training_parameters = config["training_parameters"]
     batch_size = training_parameters["batch_size"]
     max_epochs = training_parameters["max_epochs"]
@@ -234,36 +218,37 @@ def main(args):
     patience = training_parameters["adaptive_lr"]["patience"]
     adaptive_lr_factor = training_parameters["adaptive_lr"]["factor"]
     early_stop_patience = training_parameters["early_stopping"]["patience"]
-    
+    is_input_temporal = config["model_parameters"]["temporal_input"]
+    stft = None
+    window = torch.from_numpy(
+        libsegmenter.WindowSelector("hann75", "wola", model.win_size).analysis_window,
+    ).float()
+    if not is_input_temporal:
+        stft = STFTLayer(model.n_fft, model.hop_size, model.win_size, window)
+
     train_loader, val_loader = None, None
-    if args.train_dir == None or args.val_dir == None:
+    if args.dataset_dir == None:
         if args.vbd_ds == "Laroche":
             print("Using Voice-Bank-DEMAND-16k dataset with Laroche's implementation")
-            train_loader, val_loader = make_vbd_loaders( # Voice-Bank-DEMAND-16k dataset
-                batch_size=batch_size,
-                clip_len=args.clip_len,
-                num_workers=args.num_workers
+            train_loader, val_loader = (
+                make_vbd_loaders(  # Voice-Bank-DEMAND-16k dataset
+                    batch_size=batch_size,
+                    clip_len=args.clip_len,
+                    num_workers=args.num_workers,
+                )
             )
         else:
             print("Using Voice-Bank-DEMAND-16k dataset with custom implementation")
-            train_loader, val_loader = make_loaders( # Voice-Bank-DEMAND-16k dataset
+            train_loader, val_loader = make_loaders(  # Voice-Bank-DEMAND-16k dataset
                 batch_size=batch_size,
                 clip_len=args.clip_len,
-                window_len=config["data_parameters"]["block_len"],
                 mode="crop",
-                num_workers=args.num_workers
+                num_workers=args.num_workers,
             )
     else:
-        print("Using DNS Challenge 2020 dataset")
-        train_ds = DNSDataset(root=args.train_dir)
-        val_ds   = DNSDataset(root=args.val_dir)
-        train_loader = DataLoader(
-            train_ds, batch_size=batch_size,
-            shuffle=True,  num_workers=args.num_workers, pin_memory=True,
-        )
-        val_loader = DataLoader(
-            val_ds, batch_size=batch_size,
-            shuffle=False, num_workers=args.num_workers, pin_memory=True,
+        print(f"Using DNS Challenge 2020 dataset: {args.dataset_dir}")
+        train_loader, val_loader = make_dns_loaders(
+            args.dataset_dir, batch_size=batch_size, clip_len=args.clip_len
         )
 
     # ------------------------------------------------------------------
@@ -277,15 +262,27 @@ def main(args):
     # ------------------------------------------------------------------
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=adaptive_lr_factor, patience=patience,
+        optimizer,
+        mode="min",
+        factor=adaptive_lr_factor,
+        patience=patience,
     )
-    # criterion = FastULCNetLoss()
-    criterion = FastULCNetLoss(
-        n_fft=config['data_parameters']["block_len"],
-        hop_length=config['data_parameters']["block_shift"],
-        win_length=config['data_parameters']["block_len"],
-        window=model.stft_layer.window,
-    ).to(device)
+    criterion = None
+    if "loss" not in training_parameters or training_parameters["loss"] == "FastULCNet":
+        criterion = FastULCNetLoss(
+            n_fft=config["data_parameters"]["n_fft"],
+            hop_length=config["data_parameters"]["hop_size"],
+            win_length=config["data_parameters"]["win_size"],
+            window=window,
+            is_input_temporal=is_input_temporal,
+        ).to(device)
+    elif training_parameters["loss"] == "MSE":
+        criterion = MSELoss(
+            n_fft=config["data_parameters"]["n_fft"],
+            hop_length=config["data_parameters"]["hop_size"],
+            alpha=0.3,
+            is_input_temporal=is_input_temporal,
+        ).to(device)
 
     # ------------------------------------------------------------------
     # (Optional) Resume from checkpoint
@@ -310,13 +307,24 @@ def main(args):
     # ------------------------------------------------------------------
     for epoch in range(start_epoch, max_epochs):
         train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, device,
-            max_steps = args.train_steps,
-            grad_clip = args.grad_clip,
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            max_steps=args.train_steps,
+            grad_clip=args.grad_clip,
+            is_input_temporal=is_input_temporal,
+            stft=stft,
         )
         val_loss = validate(
-            model, val_loader, criterion, device,
-            max_steps = args.val_steps,
+            model,
+            val_loader,
+            criterion,
+            device,
+            max_steps=args.val_steps,
+            is_input_temporal=is_input_temporal,
+            stft=stft,
         )
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
@@ -330,23 +338,26 @@ def main(args):
 
         # Save checkpoint every epoch
         ckpt_path = os.path.join(args.save_dir, f"fast_ulcnet_epoch_{epoch:03d}.pt")
-        torch.save({
-            "epoch"         : epoch,
-            "model"         : model.state_dict(),
-            "optimizer"     : optimizer.state_dict(),
-            "val_loss"      : val_loss,
-            "best_val_loss" : best_val_loss,
-            "train_seq_len" : args.clip_len,
-        }, ckpt_path)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "val_loss": val_loss,
+                "best_val_loss": best_val_loss,
+                "train_seq_len": args.clip_len,
+            },
+            ckpt_path,
+        )
 
         # Track best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_state_dict = {k: v.cpu().clone()
-                               for k, v in model.state_dict().items()}
+            best_state_dict = {
+                k: v.cpu().clone() for k, v in model.state_dict().items()
+            }
             no_improve_epochs = 0
-            torch.save(best_state_dict,
-                       os.path.join(args.save_dir, args.output_name))
+            torch.save(best_state_dict, os.path.join(args.save_dir, args.output_name))
             print(f"  ✓ New best model saved  (val_loss={best_val_loss:.5f})")
         else:
             no_improve_epochs += 1
@@ -362,37 +373,58 @@ def main(args):
 # CLI
 # ===========================================================================
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Train Fast-ULCNet (Arrieta Larraza & de Koeijer, ICASSP 2025)"
     )
     # Paths
-    parser.add_argument("--train_dir",  type=str, default=None,
-                        help="Directory with noisy/ and clean/ sub-folders (train)")
-    parser.add_argument("--val_dir",    type=str, default=None,
-                        help="Directory with noisy/ and clean/ sub-folders (val)")
-    parser.add_argument("--save_dir",   type=str, default="checkpoints",
-                        help="Where to save model checkpoints")
-    parser.add_argument("--resume",     type=str, default=None,
-                        help="Path to a checkpoint to resume from")
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default=None,
+        help="Directory with noisy/ and clean/ sub-folders",
+    )
+    parser.add_argument(
+        "--save_dir", type=str, default=None, help="Where to save model checkpoints"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="Path to a checkpoint to resume from"
+    )
 
     # Model
-    parser.add_argument("--config", type=str, default="fast_ulcnet_networks/config.yml",
-                        help="Config file for model (.yaml)")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="fast_ulcnet_networks/config.yml",
+        help="Config file for model (.yaml)",
+    )
 
     # Training hyperparameters (paper §3.1.4)
-    parser.add_argument("--clip_len",   type=int,   default=32_000)
-    parser.add_argument("--train_steps",  type=int,   default=4000,
-                        help="Training steps per epoch (paper: 4000)")
-    parser.add_argument("--val_steps",    type=int,   default=1000,
-                        help="Validation steps per epoch (paper: 1000)")
-    parser.add_argument("--grad_clip",    type=float, default=3.0,
-                        help="Gradient clipping norm (paper: 3.0)")
+    parser.add_argument("--clip_len", type=int, default=32_000)
+    parser.add_argument(
+        "--train_steps",
+        type=int,
+        default=4000,
+        help="Training steps per epoch (paper: 4000)",
+    )
+    parser.add_argument(
+        "--val_steps",
+        type=int,
+        default=1000,
+        help="Validation steps per epoch (paper: 1000)",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=float,
+        default=3.0,
+        help="Gradient clipping norm (paper: 3.0)",
+    )
     parser.add_argument("--output_name", type=str, default="fast_ulcnet_best.pt")
 
     # Misc
-    parser.add_argument("--num_workers", type=int,   default=4)
-    parser.add_argument("--seed",        type=int,   default=42)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--vbd_ds", type=str, default="custom")
     return parser.parse_args()
 
