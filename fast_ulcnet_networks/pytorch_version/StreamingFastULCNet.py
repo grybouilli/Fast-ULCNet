@@ -100,7 +100,7 @@ class StreamingFastULCNet(FastULCNet):
         est_speech_comp = self.crm_layer(real, imag, m_real, m_imag)
         estimated_speech = self.power_law_decompression(est_speech_comp)
 
-        return torch.view_as_real(estimated_speech[:, 0]), h1, h2
+        return torch.view_as_real(estimated_speech)[:, 0], h1, h2
 
 
 if __name__ == "__main__":
@@ -116,16 +116,25 @@ if __name__ == "__main__":
 
     n_frames = 20
     freq_dim = config["data_parameters"]["n_fft"] // 2 + 1
-    noisy = torch.randn(2, n_frames, freq_dim, dtype=torch.complex64)
-
+    B = 8
+    noisy = torch.randn(B, n_frames, freq_dim, dtype=torch.complex64)
+    output_shape = None
     with torch.no_grad():
         expected = offline(noisy)
         h1, h2 = streaming.init_states(batch_size=noisy.shape[0])
         frames = []
         for t in range(n_frames):
             frame, h1, h2 = streaming(torch.view_as_real(noisy[:, t]), h1, h2)
+            output_shape = frame.shape
             frames.append(torch.view_as_complex(frame))
         output = torch.stack(frames, dim=1)
 
+    print(f"Single frame shape: {torch.view_as_real(noisy[:, 0]).shape}")
+    print(f"Single output frame shape: {output_shape}")
+    print(f"Input shape: {noisy.shape}")
+    print(f"Output shape: {output.shape}")
     print("States:", tuple(h1.shape), tuple(h2.shape))
-    print("Max abs difference streaming vs offline:", (output - expected).abs().max().item())
+    print(
+        "Max abs difference streaming vs offline:",
+        (output - expected).abs().max().item(),
+    )
