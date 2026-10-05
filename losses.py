@@ -1,6 +1,10 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import sys
+
+sys.path.insert(0, "./fast_ulcnet_networks/pytorch_version/")
+from fast_ulcnet_networks.pytorch_version.FastULCNet import ISTFT
 
 
 class FastULCNetLoss(nn.Module):
@@ -147,6 +151,70 @@ class MSELoss(nn.Module):
         return F.mse_loss(mag, mag_hat)
 
 
+class CombinedL2(nn.Module):
+    """Inspired from https://github.com/LarocheC/eco8-neaixt/blob/main/nsnet2/train.py
+
+    Args:
+        nn (_type_): _description_
+    """
+
+    def __init__(
+        self,
+        n_fft: int = 512,
+        hop_length: int = 128,
+        eps: float = 1e-8,
+        alpha: float = 3e-1,
+        is_input_temporal=True,
+    ):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.alpha = alpha
+        self.eps = eps
+        self.is_input_temporal = is_input_temporal
+        if not self.is_input_temporal:
+            self.istft = ISTFT(n_fft, hop_length, n_fft)
+
+    def _mag_phase_com(self, S: torch.Tensor) -> tuple:
+        stft_spec = torch.view_as_real(S)
+        mag = torch.sqrt((stft_spec + self.eps).pow(2).sum(-1) + 1e-9)
+        pha = torch.atan2(stft_spec[:, :, :, 1] + 1e-10, stft_spec[:, :, :, 0] + 1e-5)
+        mag = torch.pow(mag + self.eps, self.alpha)
+        com = torch.stack((mag * torch.cos(pha), mag * torch.sin(pha)), dim=-1)
+
+        return mag, pha, com
+
+    def _audio(self, S: torch.Tensor) -> torch.Tensor:
+        if self.is_input_temporal:
+            return S
+        S = S.permute(0, 2, 1)  # [B, F, T]
+        spectro = torch.stack([S.real, S.imag], dim=-1)
+        return self.istft(spectro)
+
+    def forward(
+        self, s: torch.Tensor, s_hat: torch.Tensor, eps: float = 1e-5
+    ) -> torch.Tensor:
+        if not self.is_input_temporal:
+            S = s
+            S_hat = s_hat
+        else:
+            S = stft(s, self.n_fft, self.hop_length, self.n_fft)
+            S_hat = stft(s_hat, self.n_fft, self.hop_length, self.n_fft)
+        clean_mag, clean_pha, clean_com = self._mag_phase_com(S)
+        mag_g, pha_g, com_g = self._mag_phase_com(S)
+        clean_audio, audio_g = self._audio(S), self._audio(S_hat)
+
+        loss_mag = F.mse_loss(clean_mag, mag_g)
+        # L2 Complex Loss (mag-only model: equivalent to mag loss weighted by phase coherence)
+        loss_com = F.mse_loss(clean_com, com_g) * 2
+        # Time Loss
+        loss_time = F.l1_loss(clean_audio, audio_g)
+
+        loss_gen_all = loss_mag * 0.9 + loss_com * 0.1 + loss_time * 0.2
+
+        return loss_gen_all
+
+
 # Loss instanciater
 class LossConfig:
     """
@@ -166,7 +234,7 @@ class LossConfig:
             alpha: 0.5
     """
 
-    SUPPORTED_LOSSES = {"MSE", "FastULCNet"}
+    SUPPORTED_LOSSES = {"MSE", "FastULCNet", "CombinedL2"}
 
     def __init__(self, config: dict, window: torch.Tensor, device: torch.device):
         data_p = config.get("data_parameters", {})
@@ -210,6 +278,12 @@ class LossConfig:
                     hop_length=self.hop_length,
                     win_length=self.win_length,
                     window=self.window,
+                    is_input_temporal=self.is_temporal,
+                )
+            case "CombinedL2":
+                criterion = CombinedL2(
+                    n_fft=self.n_fft,
+                    hop_length=self.hop_length,
                     is_input_temporal=self.is_temporal,
                 )
 

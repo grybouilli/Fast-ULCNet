@@ -65,16 +65,34 @@ from losses import FastULCNetLoss, MSELoss, LossConfig
 from optimizer_scheduler_inst import OptimizerSchedulerInst
 import libsegmenter
 
+
 # ---------------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------------
-
-
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+def log_losses(save_dir: str, epoch: int, train_loss: float, val_loss: float):
+    from csv import writer
+
+    filename = os.path.join(save_dir, "losses.csv")
+    fields = ["Epoch", "Train Loss", "Val Loss"]
+    if not os.path.exists(filename):
+        with open(filename, "w") as csvfile:
+            csvwriter = writer(csvfile)  # Create writer object
+            csvwriter.writerow(fields)  # Write header
+
+    with open(filename, "a", newline="") as f:
+        writer_obj = writer(f)
+        new_row = [epoch, train_loss, val_loss]
+        writer_obj.writerow(new_row)
 
 
 # ===========================================================================
@@ -321,6 +339,9 @@ def main(args):
             is_input_temporal=is_input_temporal,
             stft=stft,
         )
+
+        log_losses(args.save_dir, epoch, train_loss, val_loss)
+
         osi.step(metric=val_loss)
         current_lr = optimizer.param_groups[0]["lr"]
 
